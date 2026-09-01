@@ -1,204 +1,118 @@
-const { execFileSync, spawn } = require("child_process");
+#!/usr/bin/env node
+"use strict";
+
+const { spawn, execFileSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 
-const songsDirectory = path.resolve(__dirname, "songs");
-const socketPath = path.join("/tmp", `music-player-${process.pid}.sock`);
-const songs = fs.readdirSync(songsDirectory).filter((file) => file.endsWith(".mp3")).sort();
-const durations = songs.map(getDuration);
+const C = { reset: "\x1b[0m", dim: "\x1b[2m", cyan: "\x1b[36m", green: "\x1b[32m", selected: "\x1b[30;46m" };
+const args = process.argv.slice(2);
+const helpRequested = args.includes("--help") || args.includes("-h");
+const shuffleInitially = args.includes("--shuffle") || args.includes("-s");
+const directoryArg = args.find((arg) => !arg.startsWith("-"));
+const defaultDirectory = fs.existsSync(path.join(__dirname, "songs")) ? path.join(__dirname, "songs") : process.cwd();
+const songsDirectory = path.resolve(directoryArg || defaultDirectory);
+const socketPath = path.join(os.tmpdir(), `termusic-${process.pid}.sock`);
 
-let mpvProcess = null;
-let socket = null;
-let progressTimer = null;
-let selectedIndex = 0;
-let activeIndex = -1;
-let playbackState = "Stopped";
-let position = 0;
-let duration = 0;
-let exiting = false;
-let pendingCommands = [];
-let reconnectTimer = null;
-let firstSongStarted = false;
+let songs = [], selectedIndex = 0, activeIndex = -1, playbackState = "Stopped";
+let position = 0, duration = 0, volume = 70, shuffle = shuffleInitially, repeat = false;
+let mpvProcess, socket, progressTimer, reconnectTimer, exiting = false, pendingCommands = [];
+let statusMessage = "Choose a track and press Enter.";
 
-function getDuration(file) {
+function usage() {
+  console.log("\nTermusic — a keyboard-first terminal music player\n\nUsage: termusic [music-directory] [options]\n\nOptions:\n  -s, --shuffle   Start with shuffle enabled\n  -h, --help      Show this help\n\nControls:\n  ↑/↓ or j/k  select    Enter  play    Space  pause\n  n/p          next/previous     s  shuffle     r  repeat\n  +/-          volume             q  quit\n");
+}
+function fail(message) { process.stderr.write(`termusic: ${message}\n`); process.exit(1); }
+function commandExists(command) { try { execFileSync(process.platform === "win32" ? "where" : "which", [command], { stdio: "ignore" }); return true; } catch { return false; } }
+function durationFor(file) {
+  const fullPath = path.join(songsDirectory, file);
   try {
-    const output = execFileSync("afinfo", [path.join(songsDirectory, file)], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const match = output.match(/estimated duration:\s*([\d.]+)\s*sec/);
-    return match ? Number(match[1]) : 0;
-  } catch {
-    return 0;
-  }
+    if (process.platform === "darwin" && commandExists("afinfo")) {
+      const match = execFileSync("afinfo", [fullPath], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).match(/estimated duration:\s*([\d.]+)\s*sec/);
+      return match ? Number(match[1]) : 0;
+    }
+    if (commandExists("ffprobe")) return Number(execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", fullPath], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()) || 0;
+  } catch { /* MPV reports duration after a track loads. */ }
+  return 0;
 }
-
-function formatTime(seconds) {
-  const totalSeconds = Math.max(0, Math.floor(seconds || 0));
-  return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, "0")}`;
-}
-
-function fitText(text, width) {
-  return text.length > width ? `${text.slice(0, Math.max(0, width - 3))}...` : text;
-}
-
-function sendCommand(command) {
-  if (socket && !socket.destroyed) {
-    socket.write(`${JSON.stringify({ command })}\n`);
-  } else {
-    pendingCommands.push(command);
-  }
-}
+function formatTime(seconds) { const total = Math.max(0, Math.floor(seconds || 0)); return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`; }
+function titleFor(index) { return index < 0 ? "Nothing playing" : path.basename(songs[index].file, path.extname(songs[index].file)); }
+function truncate(text, width) { return text.length > width ? `${text.slice(0, Math.max(1, width - 1))}…` : text; }
+function send(command) { if (socket && !socket.destroyed) socket.write(`${JSON.stringify({ command })}\n`); else pendingCommands.push(command); }
+function row(text, width) { return `│ ${truncate(text, width - 4).padEnd(width - 4)} │`; }
 
 function render() {
-  const terminalWidth = Math.max(52, process.stdout.columns || 80);
-  const contentWidth = Math.min(88, terminalWidth - 4);
-  const innerWidth = contentWidth - 2;
-  const percent = duration ? Math.min(100, Math.floor((position / duration) * 100)) : 0;
-  const barWidth = Math.max(20, Math.min(42, innerWidth - 26));
-  const filled = Math.round((percent / 100) * barWidth);
-  const bar = `${"=".repeat(filled)}${"-".repeat(barWidth - filled)}`;
-  const title = activeIndex >= 0 ? songs[activeIndex].replace(/\.mp3$/, "") : "Nothing playing";
-  const line = `+${"-".repeat(innerWidth)}+`;
-  const pad = (text) => `|${` ${text}`.padEnd(innerWidth - 1)}|`;
-
-  process.stdout.write("\x1b[2J\x1b[H\x1b[36m");
-  process.stdout.write(`${" ".repeat(Math.max(0, Math.floor((terminalWidth - contentWidth) / 2)))}MUSIC PLAYER\x1b[0m\n\n`);
-  process.stdout.write(`${line}\n`);
-  process.stdout.write(`${pad("YOUR LIBRARY")}\n`);
-  process.stdout.write(`${line}\n`);
+  const columns = Math.max(58, process.stdout.columns || 80), width = Math.min(92, columns - 4), left = " ".repeat(Math.max(0, Math.floor((columns - width) / 2)));
+  const border = `┌${"─".repeat(width - 2)}┐`, divider = `├${"─".repeat(width - 2)}┤`, bottom = `└${"─".repeat(width - 2)}┘`;
+  const percent = duration ? Math.min(100, Math.round((position / duration) * 100)) : 0, barWidth = Math.max(12, Math.min(34, width - 39)), filled = Math.round(percent / 100 * barWidth);
+  const bar = `${"━".repeat(filled)}${"─".repeat(barWidth - filled)}`;
+  process.stdout.write("\x1b[2J\x1b[H");
+  process.stdout.write(`${left}${C.cyan}TERMUSIC${C.reset}  ${C.dim}${songs.length} tracks · ${path.basename(songsDirectory)}${C.reset}\n\n${left}${border}\n${left}${row("LIBRARY", width)}\n${left}${divider}\n`);
   songs.forEach((song, index) => {
-    const marker = index === selectedIndex ? ">" : " ";
-    const playing = index === activeIndex && playbackState !== "Stopped" ? " *" : "";
-    const name = fitText(song.replace(/\.mp3$/, ""), innerWidth - 13);
-    const row = `${marker} ${String(index + 1).padStart(2, "0")}  ${name}`.padEnd(innerWidth - playing.length);
-    const color = index === selectedIndex ? "\x1b[30;46m" : "\x1b[37m";
-    process.stdout.write(`${color}| ${row}${playing} |\x1b[0m\n`);
+    const marker = index === activeIndex ? (playbackState === "Paused" ? "Ⅱ" : "▶") : " ";
+    const prefix = `${index === selectedIndex ? "›" : " "} ${String(index + 1).padStart(2, "0")}  ${marker} `, suffix = `  ${formatTime(index === activeIndex ? duration : song.duration)}`;
+    const line = `${prefix}${truncate(titleFor(index), width - prefix.length - suffix.length - 4)}${suffix}`;
+    process.stdout.write(`${left}${index === selectedIndex ? `${C.selected}${row(line, width)}${C.reset}` : row(line, width)}\n`);
   });
-  process.stdout.write(`${line}\n`);
-  process.stdout.write(`${pad(`NOW PLAYING  ${fitText(title, innerWidth - 13)}`)}\n`);
-  if (firstSongStarted) process.stdout.write(`${pad("Welcome! Enjoy your music.")}\n`);
-  process.stdout.write(`${pad(`${playbackState.toUpperCase()}  [\x1b[32m${bar}\x1b[0m] ${String(percent).padStart(3, " ")}%  ${formatTime(position)} / ${formatTime(duration)}`)}\n`);
-  process.stdout.write(`${line}\n`);
-  process.stdout.write("\x1b[90m  UP/DOWN  navigate    ENTER  play    SPACE  pause/resume    Q  quit\x1b[0m\n");
+  const mode = `${shuffle ? "shuffle" : "in order"} · ${repeat ? "repeat" : "no repeat"} · vol ${volume}%`;
+  process.stdout.write(`${left}${divider}\n${left}${row(`NOW PLAYING  ${titleFor(activeIndex)}`, width)}\n${left}${row(`${playbackState.toUpperCase()}  ${C.green}${bar}${C.reset} ${String(percent).padStart(3)}%  ${formatTime(position)} / ${formatTime(duration)}`, width)}\n${left}${row(`${statusMessage}  ${mode}`, width)}\n${left}${bottom}\n${left}${C.dim}↑/↓ or j/k select  Enter play  Space pause  n/p next/prev  s shuffle  r repeat  +/- volume  q quit${C.reset}\n`);
 }
-
-function updatePosition() {
-  sendCommand(["get_property", "time-pos"]);
-  sendCommand(["get_property", "duration"]);
-  sendCommand(["get_property", "pause"]);
+function chooseNext(direction = 1) {
+  if (activeIndex < 0) return selectedIndex;
+  if (shuffle && direction > 0 && songs.length > 1) { let next = activeIndex; while (next === activeIndex) next = Math.floor(Math.random() * songs.length); return next; }
+  return (activeIndex + direction + songs.length) % songs.length;
 }
-
-function startSelected() {
-  activeIndex = selectedIndex;
-  position = 0;
-  duration = durations[activeIndex];
-  playbackState = "Playing";
-  firstSongStarted = true;
-  sendCommand(["loadfile", path.join(songsDirectory, songs[activeIndex]), "replace"]);
-  sendCommand(["set", "pause", false]);
-  render();
+function play(index) {
+  activeIndex = selectedIndex = index; position = 0; duration = songs[index].duration || 0; playbackState = "Playing"; statusMessage = `Playing ${titleFor(index)}.`;
+  send(["loadfile", path.join(songsDirectory, songs[index].file), "replace"]); send(["set_property", "pause", false]); render();
 }
-
-function togglePause() {
-  if (activeIndex < 0) return;
-  sendCommand(["cycle", "pause"]);
-  updatePosition();
+function updateProperties() { send(["get_property", "time-pos"]); send(["get_property", "duration"]); send(["get_property", "pause"]); }
+function cleanup(exitCode = 0) {
+  if (exiting) return; exiting = true; clearInterval(progressTimer); clearTimeout(reconnectTimer);
+  if (socket && !socket.destroyed) socket.destroy(); if (mpvProcess && !mpvProcess.killed) mpvProcess.kill(); try { fs.unlinkSync(socketPath); } catch {}
+  if (process.stdin.isTTY) process.stdin.setRawMode(false); process.stdout.write("\x1b[?25h\n"); process.exit(exitCode);
 }
-
-function cleanup() {
-  if (exiting) return;
-  exiting = true;
-  if (progressTimer) clearInterval(progressTimer);
-  sendCommand(["quit"]);
-  if (socket && !socket.destroyed) socket.destroy();
-  if (mpvProcess) mpvProcess.kill();
-  try {
-    if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
-  } catch {}
-  if (process.stdin.isTTY) process.stdin.setRawMode(false);
-  process.stdout.write("\x1b[?25h\n");
-}
-
 function handleMpvMessage(message) {
   if (message.event === "property-change") {
     if (message.name === "time-pos") position = message.data || 0;
-    if (message.name === "duration") duration = message.data || duration;
+    if (message.name === "duration") { duration = message.data || duration; if (activeIndex >= 0 && duration) songs[activeIndex].duration = duration; }
     if (message.name === "pause") playbackState = message.data ? "Paused" : "Playing";
     render();
   }
-  if (message.event === "end-file" && activeIndex >= 0) {
-    playbackState = "Finished";
-    position = duration;
-    render();
-  }
+  if (message.event === "end-file" && activeIndex >= 0 && message.reason === "eof") repeat ? play(activeIndex) : play(chooseNext());
 }
-
-if (songs.length === 0) {
-  console.error("No MP3 files found in songs/");
-  process.exit(1);
+function connectToMpv() {
+  if (exiting) return; socket = net.createConnection(socketPath); socket.setEncoding("utf8"); let remainder = "";
+  socket.on("data", (chunk) => { remainder += chunk; const lines = remainder.split("\n"); remainder = lines.pop(); lines.filter(Boolean).forEach((line) => { try { handleMpvMessage(JSON.parse(line)); } catch {} }); });
+  socket.on("connect", () => { pendingCommands.splice(0).forEach(send); send(["observe_property", 1, "time-pos"]); send(["observe_property", 2, "duration"]); send(["observe_property", 3, "pause"]); progressTimer ||= setInterval(updateProperties, 500); render(); });
+  socket.on("error", () => { if (!exiting && !reconnectTimer) reconnectTimer = setTimeout(() => { reconnectTimer = null; connectToMpv(); }, 100); });
 }
-
-mpvProcess = spawn("mpv", ["--idle=yes", "--no-video", "--really-quiet", `--input-ipc-server=${socketPath}`]);
-mpvProcess.on("error", (error) => {
-  if (error.code === "ENOENT") console.error("mpv is required. Install it with: brew install mpv");
-  cleanup();
-  process.exit(1);
-});
-
-const connectToMpv = () => {
-  socket = net.createConnection(socketPath);
-  socket.on("data", (data) => {
-    data.toString().split("\n").filter(Boolean).forEach((line) => {
-      try {
-        handleMpvMessage(JSON.parse(line));
-      } catch {}
-    });
+function start() {
+  if (helpRequested) return usage();
+  if (!process.stdin.isTTY || !process.stdout.isTTY) fail("an interactive terminal is required.");
+  if (!commandExists("mpv")) fail("MPV is required. Install it with: brew install mpv");
+  if (!fs.existsSync(songsDirectory)) fail(`music directory not found: ${songsDirectory}`);
+  songs = fs.readdirSync(songsDirectory, { withFileTypes: true }).filter((entry) => entry.isFile() && /\.mp3$/i.test(entry.name)).map((entry) => ({ file: entry.name, duration: durationFor(entry.name) })).sort((a, b) => a.file.localeCompare(b.file));
+  if (!songs.length) fail(`no MP3 files found in ${songsDirectory}`);
+  try { fs.unlinkSync(socketPath); } catch {}
+  mpvProcess = spawn("mpv", ["--idle=yes", "--no-video", "--really-quiet", `--input-ipc-server=${socketPath}`], { stdio: ["ignore", "ignore", "ignore"] });
+  mpvProcess.on("error", () => fail("could not launch MPV. Ensure it is installed and on PATH.")); mpvProcess.on("exit", (code) => { if (!exiting) fail(`MPV exited unexpectedly${code === null ? "" : ` (code ${code})`}.`); });
+  connectToMpv(); process.stdin.setRawMode(true); process.stdin.resume();
+  process.stdin.on("data", (input) => {
+    const key = input.toString();
+    if (key === "q" || key === "Q" || key === "\u0003") cleanup();
+    else if (key === "\u001b[A" || key === "k") { selectedIndex = (selectedIndex - 1 + songs.length) % songs.length; render(); }
+    else if (key === "\u001b[B" || key === "j") { selectedIndex = (selectedIndex + 1) % songs.length; render(); }
+    else if (key === "\r" || key === "\n") play(selectedIndex);
+    else if (key === " ") { if (activeIndex >= 0) { send(["cycle", "pause"]); statusMessage = "Toggled playback."; } }
+    else if (key === "n") play(chooseNext()); else if (key === "p") play(chooseNext(-1));
+    else if (key === "s") { shuffle = !shuffle; statusMessage = `Shuffle ${shuffle ? "on" : "off"}.`; render(); }
+    else if (key === "r") { repeat = !repeat; statusMessage = `Repeat ${repeat ? "on" : "off"}.`; render(); }
+    else if (key === "+" || key === "=") { volume = Math.min(100, volume + 5); send(["set_property", "volume", volume]); render(); }
+    else if (key === "-") { volume = Math.max(0, volume - 5); send(["set_property", "volume", volume]); render(); }
   });
-  socket.on("error", () => {
-    if (!exiting && !reconnectTimer) {
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connectToMpv();
-      }, 100);
-    }
-  });
-  socket.on("connect", () => {
-    pendingCommands.splice(0).forEach((command) => sendCommand(command));
-    sendCommand(["observe_property", 1, "time-pos"]);
-    sendCommand(["observe_property", 2, "duration"]);
-    sendCommand(["observe_property", 3, "pause"]);
-    if (!progressTimer) progressTimer = setInterval(updatePosition, 250);
-    render();
-  });
-};
-
-connectToMpv();
-process.stdin.setRawMode(true);
-process.stdin.resume();
-process.stdin.on("data", (input) => {
-  const key = input.toString();
-  if (key === "q" || key === "Q" || key === "\u0003") {
-    cleanup();
-    process.exit(0);
-  } else if (key === "\u001b[A") {
-    selectedIndex = (selectedIndex - 1 + songs.length) % songs.length;
-    render();
-  } else if (key === "\u001b[B") {
-    selectedIndex = (selectedIndex + 1) % songs.length;
-    render();
-  } else if (key === "\r" || key === "\n") {
-    startSelected();
-  } else if (key === " ") {
-    togglePause();
-  }
-});
-
-process.on("SIGINT", () => {
-  cleanup();
-  process.exit(0);
-});
-
-process.stdout.write("\x1b[?25l");
-render();
+  process.on("SIGINT", () => cleanup()); process.on("SIGTERM", () => cleanup()); process.stdout.write("\x1b[?25l"); render();
+}
+start();

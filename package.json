@@ -1,0 +1,12 @@
+{
+  "name": "termusic",
+  "version": "1.0.0",
+  "description": "A keyboard-first MP3 player for your terminal, powered by MPV.",
+  "license": "MIT",
+  "files": ["index.js", "README.md", "LICENSE"],
+  "type": "commonjs",
+  "bin": { "termusic": "./index.js" },
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node index.js", "check": "node --check index.js" },
+  "keywords": ["music", "player", "terminal", "cli", "mpv"]
+}
